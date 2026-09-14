@@ -1,0 +1,9 @@
+*.tif 
+*.tiff 
+*.h5 
+*.keras 
+*.npy 
+*.cpg 
+*.dbf 
+__pycache__/ 
+.ipynb_checkpoints/ 
