@@ -1,0 +1,6 @@
+LULC Class,Producer Accuracy (Recall),User Accuracy (Precision),F1-Score,IoU
+Dense Urban,88.25,66.74,0.76,0.6129
+Sparse Urban,41.29,10.2,0.1636,0.0891
+Vegetation,70.12,97.35,0.8152,0.6881
+Bare Soil,17.72,8.96,0.119,0.0632
+Water,85.64,79.52,0.8247,0.7017

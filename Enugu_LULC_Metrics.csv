@@ -1,0 +1,6 @@
+Class,Producer Acc (%),User Acc (%),F1-Score,IoU
+Dense Urban,92.58,52.62,0.671,0.5049
+Sparse Urban,7.39,25.08,0.1141,0.0605
+Vegetation,94.23,92.28,0.9324,0.8734
+Bare Soil,0.0,0.0,0.0,0.0
+Water,86.67,72.53,0.7897,0.6525

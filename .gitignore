@@ -1,9 +1,16 @@
-*.tif 
-*.tiff 
-*.h5 
-*.keras 
-*.npy 
-*.cpg 
-*.dbf 
-__pycache__/ 
-.ipynb_checkpoints/ 
+# Ignore spatial data and imagery
+*.tif
+*.tiff
+*.shp
+*.geojson
+
+# Ignore trained models and weights
+*.keras
+*.h5
+*.hdf5
+
+# Ignore Python environments and cache
+venv/
+.env
+__pycache__/
+.ipynb_checkpoints/

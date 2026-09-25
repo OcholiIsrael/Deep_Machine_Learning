@@ -1,0 +1,4 @@
+Class,Producer Acc (%),User Acc (%),F1-Score,IoU
+Cool/Non-UHI,2.5,56.99,0.0479,0.0246
+Neutral,16.86,34.51,0.2266,0.1277
+Hotspot,96.33,37.7,0.542,0.3717

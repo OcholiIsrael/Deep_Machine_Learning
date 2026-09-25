@@ -1,0 +1,240 @@
+import os
+import numpy as np
+import rasterio
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from scipy.ndimage import binary_dilation
+from tensorflow.keras import layers, models, utils
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+
+print("Initializing Spatial Edge-Growth ConvLSTM Pipeline...")
+base_folder = "C:\\Users\\PC\\Documents\\MSc_Enugu_Data\\"
+years = [2000, 2010, 2015, 2020, 2024]
+TOTAL_CITY_AREA_KM2 = 560.39
+
+# ==========================================
+# 1. SETUP & MASKING
+# ==========================================
+with rasterio.open(os.path.join(base_folder, "Enugu_2024_COMPLETE_ANALYSIS_STACK.tif")) as src:
+    meta = src.meta.copy()
+    height, width = src.shape
+    valid_mask_full = src.read(15) 
+
+inside_city_mask = ~np.isnan(valid_mask_full) & (valid_mask_full != 0)
+pad_h, pad_w = (32 - (height % 32)) % 32, (32 - (width % 32)) % 32
+padded_h, padded_w = height + pad_h, width + pad_w
+
+# ==========================================
+# 2. LOAD DATA
+# ==========================================
+temporal_tensor = np.zeros((5, padded_h, padded_w, 8), dtype=np.float32)
+raw_lulc_history = np.zeros((5, padded_h, padded_w), dtype=np.float32)
+
+for t, year in enumerate(years):
+    with rasterio.open(os.path.join(base_folder, f"Enugu_{year}_COMPLETE_ANALYSIS_STACK.tif")) as src:
+        lulc = np.nan_to_num(src.read(14), nan=2.0) 
+        uhi_raw = np.nan_to_num(src.read(13), nan=0.0)
+        
+        uhi_c = np.zeros_like(uhi_raw)
+        uhi_c[uhi_raw < -1.5] = 0
+        uhi_c[(uhi_raw >= -1.5) & (uhi_raw <= 1.5)] = 1
+        uhi_c[uhi_raw > 1.5] = 2
+        
+        lulc_padded = np.pad(lulc, ((0, pad_h), (0, pad_w)), mode='edge')
+        uhi_padded = np.pad(uhi_c, ((0, pad_h), (0, pad_w)), mode='edge')
+        
+        raw_lulc_history[t] = lulc_padded
+        temporal_tensor[t] = np.concatenate([utils.to_categorical(lulc_padded, 5), 
+                                             utils.to_categorical(uhi_padded, 3)], axis=-1)
+
+# ==========================================
+# 3. CHIP EXTRACTION & TRAINING
+# ==========================================
+print("Generating spatial chips and training ConvLSTM...")
+chip_size = 32
+X_train, Y_lulc_train, Y_uhi_train, locked_coords = [], [], [], []
+
+for y in range(0, padded_h, chip_size):
+    for x in range(0, padded_w, chip_size):
+        if np.any(inside_city_mask[y:min(y+chip_size, height), x:min(x+chip_size, width)]):
+            X_train.append(temporal_tensor[0:4, y:y+chip_size, x:x+chip_size, :])
+            Y_lulc_train.append(np.argmax(temporal_tensor[4, y:y+chip_size, x:x+chip_size, 0:5], axis=-1))
+            Y_uhi_train.append(np.argmax(temporal_tensor[4, y:y+chip_size, x:x+chip_size, 5:8], axis=-1))
+            locked_coords.append((y, x))
+
+inputs = layers.Input(shape=(4, 32, 32, 8)) 
+x = layers.ConvLSTM2D(filters=64, kernel_size=(3, 3), padding='same', return_sequences=True)(inputs)
+x = layers.BatchNormalization()(x)
+x = layers.ConvLSTM2D(filters=64, kernel_size=(3, 3), padding='same', return_sequences=False)(x)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.2)(x)
+lulc_out = layers.Conv2D(filters=5, kernel_size=(1, 1), activation='softmax', name='lulc_output')(x)
+uhi_out = layers.Conv2D(filters=3, kernel_size=(1, 1), activation='softmax', name='uhi_output')(x)
+
+model = models.Model(inputs=inputs, outputs=[lulc_out, uhi_out])
+model.compile(optimizer=Adam(learning_rate=0.001), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+model.fit(np.array(X_train), {'lulc_output': np.array(Y_lulc_train), 'uhi_output': np.array(Y_uhi_train)}, 
+          epochs=60, batch_size=16, validation_split=0.1, 
+          callbacks=[EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)])
+
+# ==========================================
+# 4. EDGE-GROWTH CA LOGIC & PREDICTION
+# ==========================================
+area_stats_lulc = []
+area_stats_uhi = []
+
+def predict_and_stitch(input_chips, year_name, previous_lulc_map):
+    print(f"\nSimulating spatial edge-growth for {year_name}...")
+    preds = model.predict(input_chips, batch_size=16)
+    
+    pred_lulc = np.argmax(preds[0], axis=-1)
+    pred_uhi = np.argmax(preds[1], axis=-1)
+    
+    canvas_lulc = np.full((padded_h, padded_w), 2.0, dtype=np.float32)
+    canvas_uhi = np.zeros((padded_h, padded_w), dtype=np.float32)
+    
+    for idx, (y, x) in enumerate(locked_coords):
+        canvas_lulc[y:y+chip_size, x:x+chip_size] = pred_lulc[idx]
+        canvas_uhi[y:y+chip_size, x:x+chip_size] = pred_uhi[idx]
+        
+    # --- 1. IRREVERSIBLE URBANIZATION ---
+    canvas_lulc[previous_lulc_map == 4] = 4 # Water locked
+    canvas_lulc[previous_lulc_map == 0] = 0 # Dense locked
+    canvas_lulc[(previous_lulc_map == 1) & (canvas_lulc > 1)] = 1 # Sparse cannot degrade
+    canvas_lulc[(previous_lulc_map == 3) & (canvas_lulc == 2)] = 3 # Bare soil cannot become veg
+
+    # --- 2. PERIMETER EXPANSION (DILATION) ---
+    # Densification: Sparse adjacent to Dense becomes Dense
+    dense_fringe = binary_dilation((canvas_lulc == 0), iterations=1)
+    canvas_lulc[dense_fringe & (canvas_lulc == 1)] = 0
+    
+    # Peri-urban Sprawl: Expand the urban boundary outward by 2 pixels (~60 meters every 5 years)
+    urban_perimeter = binary_dilation((canvas_lulc == 0) | (canvas_lulc == 1), iterations=2)
+    
+    # Bare soil on the perimeter is developed into Sparse Urban
+    canvas_lulc[urban_perimeter & (canvas_lulc == 3)] = 1
+    # Vegetation on the perimeter is cleared into Bare Soil
+    canvas_lulc[urban_perimeter & (canvas_lulc == 2)] = 3
+    
+    # --- 3. THERMAL COUPLING (UHI) ---
+    # Force thermal logic to match physical concrete expansion
+    canvas_uhi[(canvas_lulc == 0) & (canvas_uhi == 0)] = 2 # Dense urban cannot be a coldspot
+    canvas_uhi[(canvas_lulc == 1) & (canvas_uhi == 0)] = 1 # Sparse urban is at least neutral
+    canvas_uhi[(canvas_lulc == 2) & (canvas_uhi == 2)] = 0 # Vegetation cannot be a hotspot
+
+    city_lulc = canvas_lulc[:height, :width].copy()
+    city_uhi = canvas_uhi[:height, :width].copy()
+    
+    city_lulc[~inside_city_mask] = np.nan
+    city_uhi[~inside_city_mask] = np.nan
+    
+    # --- 4. CALCULATE EXACT KM2 LANDMASS ---
+    unique, counts = np.unique(city_lulc[~np.isnan(city_lulc)], return_counts=True)
+    px_counts = dict(zip(unique, counts))
+    multiplier = TOTAL_CITY_AREA_KM2 / sum(px_counts.values())
+    
+    area_stats_lulc.append({
+        'Year': year_name,
+        'Dense Urban': round(px_counts.get(0, 0) * multiplier, 2),
+        'Sparse Urban': round(px_counts.get(1, 0) * multiplier, 2),
+        'Vegetation': round(px_counts.get(2, 0) * multiplier, 2),
+        'Bare Soil': round(px_counts.get(3, 0) * multiplier, 2),
+        'Water': round(px_counts.get(4, 0) * multiplier, 2)
+    })
+    
+    u_unique, u_counts = np.unique(city_uhi[~np.isnan(city_uhi)], return_counts=True)
+    u_px = dict(zip(u_unique, u_counts))
+    
+    area_stats_uhi.append({
+        'Year': year_name,
+        'Coldspot': round(u_px.get(0, 0) * multiplier, 2),
+        'Neutral': round(u_px.get(1, 0) * multiplier, 2),
+        'Hotspot': round(u_px.get(2, 0) * multiplier, 2)
+    })
+    
+    # Export
+    meta.update(count=1, dtype=rasterio.float32, nodata=np.nan)
+    with rasterio.open(os.path.join(base_folder, f"Enugu_{year_name}_PREDICTED_LULC.tif"), 'w', **meta) as dst:
+        dst.write(city_lulc, 1)
+    with rasterio.open(os.path.join(base_folder, f"Enugu_{year_name}_PREDICTED_UHI.tif"), 'w', **meta) as dst:
+        dst.write(city_uhi, 1)
+        
+    return canvas_lulc, canvas_uhi
+
+# ==========================================
+# 5. RECURSIVE FORECAST EXECUTION
+# ==========================================
+X_2030_input = np.array([temporal_tensor[1:5, y:y+chip_size, x:x+chip_size, :] for y, x in locked_coords])
+lulc_2030_canvas, uhi_2030_canvas = predict_and_stitch(X_2030_input, "2030", raw_lulc_history[4])
+
+X_2035_input = []
+for idx, (y, x) in enumerate(locked_coords):
+    step_2030 = np.expand_dims(np.concatenate([utils.to_categorical(lulc_2030_canvas[y:y+chip_size, x:x+chip_size], 5), 
+                                               utils.to_categorical(uhi_2030_canvas[y:y+chip_size, x:x+chip_size], 3)], axis=-1), axis=0)
+    X_2035_input.append(np.concatenate([temporal_tensor[2:5, y:y+chip_size, x:x+chip_size, :], step_2030], axis=0))
+lulc_2035_canvas, uhi_2035_canvas = predict_and_stitch(np.array(X_2035_input), "2035", lulc_2030_canvas)
+
+X_2040_input = []
+for idx, (y, x) in enumerate(locked_coords):
+    step_2030 = np.expand_dims(np.concatenate([utils.to_categorical(lulc_2030_canvas[y:y+chip_size, x:x+chip_size], 5), utils.to_categorical(uhi_2030_canvas[y:y+chip_size, x:x+chip_size], 3)], axis=-1), axis=0)
+    step_2035 = np.expand_dims(np.concatenate([utils.to_categorical(lulc_2035_canvas[y:y+chip_size, x:x+chip_size], 5), utils.to_categorical(uhi_2035_canvas[y:y+chip_size, x:x+chip_size], 3)], axis=-1), axis=0)
+    X_2040_input.append(np.concatenate([temporal_tensor[3:5, y:y+chip_size, x:x+chip_size, :], step_2030, step_2035], axis=0))
+lulc_2040_canvas, uhi_2040_canvas = predict_and_stitch(np.array(X_2040_input), "2040", lulc_2035_canvas)
+
+X_2045_input = []
+for idx, (y, x) in enumerate(locked_coords):
+    step_2030 = np.expand_dims(np.concatenate([utils.to_categorical(lulc_2030_canvas[y:y+chip_size, x:x+chip_size], 5), utils.to_categorical(uhi_2030_canvas[y:y+chip_size, x:x+chip_size], 3)], axis=-1), axis=0)
+    step_2035 = np.expand_dims(np.concatenate([utils.to_categorical(lulc_2035_canvas[y:y+chip_size, x:x+chip_size], 5), utils.to_categorical(uhi_2035_canvas[y:y+chip_size, x:x+chip_size], 3)], axis=-1), axis=0)
+    step_2040 = np.expand_dims(np.concatenate([utils.to_categorical(lulc_2040_canvas[y:y+chip_size, x:x+chip_size], 5), utils.to_categorical(uhi_2040_canvas[y:y+chip_size, x:x+chip_size], 3)], axis=-1), axis=0)
+    X_2045_input.append(np.concatenate([temporal_tensor[4:5, y:y+chip_size, x:x+chip_size, :], step_2030, step_2035, step_2040], axis=0))
+lulc_2045_canvas, uhi_2045_canvas = predict_and_stitch(np.array(X_2045_input), "2045", lulc_2040_canvas)
+
+# ==========================================
+# 6. PRINT QUANTITATIVE TABLES
+# ==========================================
+print("\n--- FORECASTED LULC AREA (km²) ---")
+df_lulc = pd.DataFrame(area_stats_lulc)
+print(df_lulc.to_string(index=False))
+df_lulc.to_csv(os.path.join(base_folder, "Enugu_Forecast_LULC_km2.csv"), index=False)
+
+print("\n--- FORECASTED UHI HOTSPOTS (km²) ---")
+df_uhi = pd.DataFrame(area_stats_uhi)
+print(df_uhi.to_string(index=False))
+df_uhi.to_csv(os.path.join(base_folder, "Enugu_Forecast_UHI_km2.csv"), index=False)
+
+# ==========================================
+# 7. FINAL VISUALIZATION
+# ==========================================
+print("\nRendering outward sprawl maps...")
+lulc_colors = ListedColormap(['#FF0000', '#FFA500', '#00A000', '#8B4513', '#0000FF'])
+uhi_colors = ListedColormap(['#0000FF', '#FFFFFF', '#FF0000'])
+
+fig, axes = plt.subplots(4, 2, figsize=(18, 36))
+fig.suptitle("Spatial Edge-Growth Sprawl Forecast: Enugu 2030 - 2045", fontsize=28, fontweight='bold', y=0.92)
+
+canvases = [
+    (lulc_2030_canvas, uhi_2030_canvas, "2030"),
+    (lulc_2035_canvas, uhi_2035_canvas, "2035"),
+    (lulc_2040_canvas, uhi_2040_canvas, "2040"),
+    (lulc_2045_canvas, uhi_2045_canvas, "2045")
+]
+
+for i, (lulc_c, uhi_c, year_str) in enumerate(canvases):
+    plot_lulc = lulc_c[:height, :width].copy()
+    plot_lulc[~inside_city_mask] = np.nan
+    plot_uhi = uhi_c[:height, :width].copy()
+    plot_uhi[~inside_city_mask] = np.nan
+
+    axes[i, 0].imshow(plot_lulc, cmap=lulc_colors, vmin=0, vmax=4)
+    axes[i, 0].set_title(f"Predicted LULC ({year_str})", fontsize=20, pad=15)
+    axes[i, 0].axis('off')
+
+    axes[i, 1].imshow(plot_uhi, cmap=uhi_colors, vmin=0, vmax=2)
+    axes[i, 1].set_title(f"Predicted UHI Hotspots ({year_str})", fontsize=20, pad=15)
+    axes[i, 1].axis('off')
+
+plt.tight_layout(rect=[0, 0, 1, 0.9])
+plt.show()

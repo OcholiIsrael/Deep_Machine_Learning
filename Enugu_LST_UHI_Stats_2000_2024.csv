@@ -1,0 +1,7 @@
+system:index,Coldspot Zone (km²),Mean LST (°C),Neutral Zone (km²),UHI Hotspot Zone (km²),Year,.geo
+0,47.50,35.60,480.00,32.89,2000,"{""type"":""MultiPoint"",""coordinates"":[]}"
+1,40.66,32.41,486.27,32.99,2005,"{""type"":""MultiPoint"",""coordinates"":[]}"
+2,33.92,34.24,486.37,34.09,2010,"{""type"":""MultiPoint"",""coordinates"":[]}"
+3,50.36,37.34,490.03,20.00,2015,"{""type"":""MultiPoint"",""coordinates"":[]}"
+4,49.99,38.11,482.13,28.28,2020,"{""type"":""MultiPoint"",""coordinates"":[]}"
+5,46.34,38.74,491.07,22.99,2024,"{""type"":""MultiPoint"",""coordinates"":[]}"
